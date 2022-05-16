@@ -3,12 +3,13 @@ import boto3
 import logging
 import botocore.exceptions
 import time
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta, date
 
 logging.basicConfig(filename='vpc_slayer.log',
                     encoding='utf-8', level=logging.DEBUG)
 
 logger = logging.getLogger()
+
 
 def get_regions():
     region_list = []
@@ -17,6 +18,62 @@ def get_regions():
     for r in all_regions['Regions']:
         region_list.append(r['RegionName'])
     return region_list
+
+
+def rds_slayer(region, age):
+    rds = boto3.client('rds', region)
+    threshold = (datetime.now() - timedelta(days=age))
+    slayable = []
+    success = 0
+    fails = 0
+    today = date.today().strftime("%d-%m-%Y")
+
+    # find old instances
+    response = rds.describe_db_instances()
+    for instance in response['DBInstances']:
+        launchtime = instance['InstanceCreateTime'].replace(tzinfo=None)
+        if launchtime < threshold:
+            slayable.append(instance)
+
+    # destroy old instances
+    for instance in slayable:
+        is_cluster = False
+        instance_id = instance['DBInstanceIdentifier']
+        try:
+            if instance['DBClusterIdentifier']:
+                is_cluster = True
+        except Exception as e:
+            logger.info(e)
+            is_cluster = False
+
+        if is_cluster:
+            try:
+                rds.delete_db_instance(
+                    DBInstanceIdentifier=instance_id,
+                    SkipFinalSnapshot=False,
+                    DeleteAutomatedBackups=True
+                )
+                success += 1
+            except Exception as e:
+                fails += 1
+                print(e)
+
+        else:
+            try:
+                final_snap_id = f'final-{instance_id}-{today}'
+                rds.delete_db_instance(
+                    DBInstanceIdentifier=instance_id,
+                    SkipFinalSnapshot=False,
+                    FinalDBSnapshotIdentifier=final_snap_id,
+                    DeleteAutomatedBackups=True
+                )
+                success += 1
+            except Exception as e:
+                fails += 1
+                print(e)
+
+    return success, fails
+
 
 def slay_eips(region):
     client = boto3.client('ec2', region_name=region)
@@ -30,13 +87,13 @@ def slay_eips(region):
                 slayed += 1
                 client.release_address(AllocationId=eip_dict['AllocationId'])
             except Exception as e:
-                failed =+ 1
+                failed += 1
                 print(e)
     return slayed, failed
 
+
 def ebs_slayer(region, age, dryrun):
     ec2 = boto3.resource('ec2', region_name=region)
-    ec2client = ec2.meta.client
     threshold = (datetime.now() - timedelta(days=age)).timestamp()
     unattached = []
     slayable_vols = []
@@ -44,21 +101,22 @@ def ebs_slayer(region, age, dryrun):
     for volume in volumes:
         if len(volume.attachments) == 0:
             unattached.append(volume)
-    
+
     for volume in unattached:
         if volume.create_time.timestamp() < threshold:
             slayable_vols.append(volume)
-    
+
     failed = 0
     for volume in slayable_vols:
-        try: 
+        try:
             volume.delete(DryRun=dryrun)
         except Exception as e:
             failed = + 1
             print(e)
-    
+
     return len(slayable_vols), failed
-    
+
+
 def get_vpcs(region):
     ec2 = boto3.resource('ec2', region_name=region)
     ec2client = ec2.meta.client
@@ -68,45 +126,41 @@ def get_vpcs(region):
         vpc_list.append(all_vpcs['Vpcs'][index]['VpcId'])
     return vpc_list
 
+
 def ec2_in_vpc(vpcid, region):
     '''checks if there are any EC2 Instances in a VPC'''
     ec2 = boto3.resource('ec2', region)
-    ec2client = ec2.meta.client
     vpc = ec2.Vpc(vpcid)
 
     instances = vpc.instances.all()
-    ec2_list =[] 
+    ec2_list = []
     for instance in instances:
         ec2_list.append(instance.id)
-    
+
     if not ec2_list:
         return False
     else:
         return True
 
-def rds_slayer():
-    '''check on the status of RDS / kill instances'''
-    pass
 
 def ec2_slayer(vpcid, region, age, DryRun):
     # Cleaning up very old instances
     ec2 = boto3.resource('ec2', region)
-    ec2client = ec2.meta.client
     vpc = ec2.Vpc(vpcid)
-    
+
     old_ec2 = []
     ec2_slayed = 0
     attempted_slays = 0
     instances = vpc.instances.all()
     threshold = (datetime.now() - timedelta(days=age)).timestamp()
     stoped_running = []
-    
+
     for instance in instances:
         if instance.state['Name'] in ['running', 'stopped']:
             stoped_running.append(instance.id)
             if instance.launch_time.timestamp() < threshold:
                 old_ec2.append(instance)
-    
+
     for instance in old_ec2:
         try:
             attempted_slays += 1
@@ -116,6 +170,7 @@ def ec2_slayer(vpcid, region, age, DryRun):
             print(e)
     return ec2_slayed, attempted_slays
 
+
 def elb_slayer(region, age):
     elb = boto3.client('elb', region)
     threshold = (datetime.now() - timedelta(days=age))
@@ -123,6 +178,7 @@ def elb_slayer(region, age):
     fails = 0
     allElbs = elb.describe_load_balancers()
 
+    # clean up empty ELB-Classics
     for lb in allElbs['LoadBalancerDescriptions']:
         if len(lb['Instances']) == 0:
             try:
@@ -132,8 +188,8 @@ def elb_slayer(region, age):
             except Exception as e:
                 fails += 1
                 print(e)
-    
-    #look for old ELBs
+
+    # look for old ELBs
     for lb in allElbs['LoadBalancerDescriptions']:
         createtime = lb['CreatedTime']
         createtime = createtime.replace(tzinfo=None)
@@ -148,6 +204,7 @@ def elb_slayer(region, age):
 
     return tries, fails
 
+
 # obliterates a vpc
 def vpc_cleanup(vpcid, region):
     vpc_slayed = 0
@@ -155,24 +212,21 @@ def vpc_cleanup(vpcid, region):
     ec2client = ec2.meta.client
     vpc = ec2.Vpc(vpcid)
     logger.info(f'Attempting removal VPC {vpcid} from AWS {region}')
-   
-### Search for and remove attached Nat Gateways
+
+    # Search for and remove attached Nat Gateways
     for ep in ec2client.describe_nat_gateways(
         Filters=[
             {
             'Name': 'vpc-id',
             'Values': [vpcid]
-            }
-        ]
-        )['NatGateways']:
-            try:
-                ec2client.delete_nat_gateway(
-                NatGatewayId=ep['NatGatewayId'])
-            except Exception as e:
-                print(e)
-                continue
+            }])['NatGateways']:
+        try:
+            ec2client.delete_nat_gateway(NatGatewayId=ep['NatGatewayId'])
+        except Exception as e:
+            print(e)
+            continue
 
-### Search for and remove attached internet Gateways
+    # Search for and remove attached internet Gateways
     for ep in ec2client.describe_internet_gateways(
             Filters=[
                 {'Name': 'attachment.vpc-id',
@@ -180,27 +234,30 @@ def vpc_cleanup(vpcid, region):
                  }
             ]
             )['InternetGateways']:
-                try:
-                    vpc.detach_internet_gateway(InternetGatewayId=ep['InternetGatewayId'])
-                    ec2client.delete_internet_gateway(
-                        InternetGatewayId=ep['InternetGatewayId'])
-                except botocore.exceptions.ClientError as error:
-                    if error.response['Error']['Code'] == 'DependencyViolation':
-                        logger.warning("waiting for network interfaces to be deleted")
-                    continue
-    
-     # remove interfaces and subnets
+        try:
+            vpc.detach_internet_gateway(
+                InternetGatewayId=ep['InternetGatewayId'])
+            ec2client.delete_internet_gateway(
+                InternetGatewayId=ep['InternetGatewayId'])
+        except botocore.exceptions.ClientError as error:
+            if error.response['Error']['Code'] == 'DependencyViolation':
+                logger.warning("waiting for network interfaces to be deleted")
+            continue
+
+    # remove interfaces and subnets
     for subnet in vpc.subnets.all():
         for interface in subnet.network_interfaces.all():
             try:
                 interface.delete()
-            except:
+            except Exception as e:
+                logger.info(e)
                 continue
     for subnet in vpc.subnets.all():
-        try:    
+        try:
             subnet.delete()
-        except:
-                continue
+        except Exception as e:
+            logger.info(e)
+            continue
 
     # delete all route table associations
     for rt in vpc.route_tables.all():
@@ -215,7 +272,8 @@ def vpc_cleanup(vpcid, region):
     for rt in vpc.route_tables.all():
         try:
             rt.delete()
-        except:
+        except Exception as e:
+            logger.info(e)
             continue
 
     # delete our endpoints
@@ -225,10 +283,11 @@ def vpc_cleanup(vpcid, region):
                 'Values': [vpcid]
             }])['VpcEndpoints']:
         try:
-            ec2client.delete_vpc_endpoints(VpcEndpointIds=[ep['VpcEndpointId']])
+            ec2client.delete_vpc_endpoints(
+                VpcEndpointIds=[ep['VpcEndpointId']])
         except Exception as e:
             print(e)
-   
+
     # delete our security groups
     for sg in vpc.security_groups.all():
         if sg.group_name != 'default':
@@ -236,7 +295,7 @@ def vpc_cleanup(vpcid, region):
                 sg.delete()
             except Exception as e:
                 print(e)
-   
+
     # delete non-default network acls
     for netacl in vpc.network_acls.all():
         if not netacl.is_default:
@@ -251,22 +310,22 @@ def vpc_cleanup(vpcid, region):
                 'Name': 'requester-vpc-info.vpc-id',
                 'Values': [vpcid]
             }])['VpcPeeringConnections']:
-            try:
-                ec2.VpcPeeringConnection(vpcpeer['VpcPeeringConnectionId']).delete()
-            except Exception as e:
-                print(e)
+        try:
+            ec2.VpcPeeringConnection(vpcpeer['VpcPeeringConnectionId']).delete()
+        except Exception as e:
+            print(e)
 
     for vpcpeer in ec2client.describe_vpc_peering_connections(
             Filters=[{
                 'Name': 'accepter-vpc-info.vpc-id',
                 'Values': [vpcid]
             }])['VpcPeeringConnections']:
-            try:
-                ec2.VpcPeeringConnection(
-                    vpcpeer['VpcPeeringConnectionId']).delete()
-            except Exception as e:
-                print(e)
-   
+        try:
+            ec2.VpcPeeringConnection(
+                vpcpeer['VpcPeeringConnectionId']).delete()
+        except Exception as e:
+            print(e)
+
     # finally, delete the vpc
     try:
         ec2client.delete_vpc(VpcId=vpcid)
@@ -276,14 +335,19 @@ def vpc_cleanup(vpcid, region):
 
     return vpc_slayed
 
+
 def main(argv=None):
-    #regions = ["us-east-2"]
-    age = 60
+    # regions = ["us-east-2"]
+    age = 90
     dryrun = False
-    
     regions = get_regions()
 
-    #Slay out of serivce ELBs
+    # slay old RDS
+    for region in regions:
+        success, fails = rds_slayer(region, age)
+        print(f'{region}:RDS: Terminated: {success}, Failed to Terminate: {fails}')
+
+    # Slay out of serivce ELBs
     for region in regions:
         tries, fails = elb_slayer(region, age)
         print(f'{region}:ELB: Attempted {tries} kills. Failed on {fails}')
@@ -299,7 +363,7 @@ def main(argv=None):
         canidates, failed = ebs_slayer(region, age, dryrun)
         print(f'{region}:EBS: Tried to slay {canidates}, failed on {failed}')
         logger.info(f'{region}:EBS: Tried to slay {canidates}, failed on {failed}')
-    
+
     # Slay Old EC2s
     for region in regions:
         slayed = 0
@@ -317,8 +381,6 @@ def main(argv=None):
     # Sit tight while the ec2 instances spin down
     time.sleep(60)
 
-    # Slay old RDS Clusters and Instances
-
     # Slay old RDS Snapshots
 
     # Slay old ECS
@@ -335,23 +397,33 @@ def main(argv=None):
 
         for vpc in vpc_ids:
             status = None
-            status = ec2_in_vpc(vpc,region)
-           
-           # negative result means the vpc has no ec2
+            status = ec2_in_vpc(vpc, region)
+
+            # negative result means the vpc has no ec2
             if not status:
                 empty_vpcs.append(vpc)
 
         print(f'{region}: Found {len(empty_vpcs)} VPCs with no EC2')
-        
+
         if not dryrun:
             for vpc in empty_vpcs:
-                print(f"killing {vpc}")  
-                slayed_vpcs = []
+                print(f"killing {vpc}")
                 result = vpc_cleanup(vpc, region)
                 if result:
                     vpc_headcount += 1
 
         print(f'{region}: Removed {vpc_headcount} VPCs')
 
+
 if __name__ == '__main__':
     main(sys.argv)
+
+
+''' do to list '''
+# Virtual private Gateways are a problem (using up EIPs / preventing VPC recovery)
+# upgrade the ELB slayer to v2 of the boto. allows for all types of ELBs, not just classics
+# client = boto3.client('elbv2')
+# cloud HSMS
+# clean up empty and old EKS clusters (be careful with this one)
+# clean up empty and old ECS clusters / tasks
+
